@@ -356,6 +356,65 @@ impl Model {
         }
         self.norm.forward(&h)
     }
+
+    fn key_padding_mask(
+        &self,
+        attention_mask: &Tensor, // (B, L), 1/0
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (b, l) = attention_mask.dims2()?;
+        // to model dtype/device and shape to (B,1,1,L)
+        let attn = attention_mask
+            .to_dtype(self.dtype)?
+            .to_device(&self.device)?
+            .unsqueeze(1)? // (B,1,L)
+            .unsqueeze(1)?; // (B,1,1,L)
+
+        // inv = 1 - attn  -> 1 at pad, 0 at valid
+        let inv = attn.neg()?.add_scalar(1.0)?; // (B,1,1,L)
+
+        // Use a large negative (avoid -inf * 0 -> NaN issues)
+        let minv = Tensor::new(-1e9f32, &self.device)?.to_dtype(self.dtype)?;
+        let key_mask = inv * &minv?; // (B,1,1,L): 0 for valid, -1e9 for pad
+
+        if offset == 0 {
+            Ok(key_mask)
+        } else {
+            // Past tokens (from KV cache) are assumed valid -> prepend zeros for them.
+            let zeros_past = Tensor::zeros((b, 1, 1, offset), self.dtype, &self.device)?;
+            Tensor::cat(&[&zeros_past, &key_mask], 3) // (B,1,1,L+offset)
+        }
+    }
+
+    /// Forward that accepts a (B, L) attention mask (1=keep, 0=pad) and combines it with causal mask.
+    pub fn forward_with_attention(
+        &mut self,
+        input: &Tensor,              // (B, L)
+        attention_mask: Option<&Tensor>, // (B, L) 1/0
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (b, l) = input.dims2()?;
+        let mut h = self.embed_tokens.forward(input)?;
+
+        // Build causal mask when L > 1 (prefill). Decode step (L==1) uses None for speed.
+        let causal = if l == 1 { None } else { Some(self.causal_mask(b, l, offset, None)?) };
+
+        // Optionally build key padding mask and combine.
+        let combined = match (causal, attention_mask) {
+            (None, None) => None,
+            (Some(c), None) => Some(c),
+            (None, Some(am)) => Some(self.key_padding_mask(am, offset)?),
+            (Some(c), Some(am)) => {
+                let kpm = self.key_padding_mask(am, offset)?;
+                Some(c.broadcast_add(&kpm)?) // shapes: (B,1,L,L+off) + (B,1,1,L+off)
+            }
+        };
+
+        for layer in &mut self.layers {
+            h = layer.forward(&h, combined.as_ref(), offset)?;
+        }
+        self.norm.forward(&h)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -385,5 +444,18 @@ impl ModelForCausalLM {
 
     pub fn clear_kv_cache(&mut self) {
         self.base.clear_kv_cache();
+    }
+
+    pub fn forward_with_attention(
+        &mut self,
+        input: &Tensor,                 // (B, L)
+        attention_mask: Option<&Tensor>,// (B, L)
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (_, l) = input.dims2()?;
+        self.base
+            .forward_with_attention(input, attention_mask, offset)?
+            .narrow(1, l - 1, 1)?
+            .apply(&self.lm_head)
     }
 }
