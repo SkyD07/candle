@@ -202,8 +202,8 @@ impl Qwen3Attention {
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // 3. Per‑head RMSNorm
-        let q_flat = q.flatten(0, 2)?; // (B*H, L, D) -> (BHL, D) after transpose later
+        // 3. Per-head RMSNorm
+        let q_flat = q.flatten(0, 2)?; // (B*H, L, D)
         let k_flat = k.flatten(0, 2)?;
         let q_flat = self.q_norm.forward(&q_flat)?;
         let k_flat = self.k_norm.forward(&k_flat)?;
@@ -224,6 +224,7 @@ impl Qwen3Attention {
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = attn_mask {
+            // m: (B, 1, L, S) where S = L + offset
             scores = scores.broadcast_add(m)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
@@ -314,6 +315,7 @@ impl Model {
         }
     }
 
+    /// Build a standard causal mask of shape (B, 1, L, L+offset)
     fn causal_mask(
         &self,
         b: usize,
@@ -341,6 +343,76 @@ impl Model {
         Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
     }
 
+    /// Convert a (B, S) key-padding mask (1=keep, 0=pad) into an additive mask (B,1,1,S).
+    /// Uses the log trick: log(1)=0, log(0)=-inf (safe for softmax).
+    fn key_padding_to_additive(&self, key_pad: &Tensor) -> Result<Tensor> {
+        let (b, s) = key_pad.dims2()?;
+        let kp_f32 = key_pad.to_dtype(DType::F32)?; // stay on device
+        let add = kp_f32.log()?;                    // 1 -> 0, 0 -> -inf
+        add.reshape((b, 1, 1, s))?.to_dtype(self.dtype)
+    }
+
+    /// Combine causal (B,1,L,S) with key-padding (B,1,1,S) if provided.
+    fn build_attn_mask(
+        &self,
+        b: usize,
+        l: usize,
+        offset: usize,
+        key_pad: Option<&Tensor>, // expected shape: (B, L+offset)
+    ) -> Result<Option<Tensor>> {
+        let s = l + offset;
+
+        // Causal: skip when L==1 (decode step)
+        let causal = if l == 1 {
+            None
+        } else {
+            Some(self.causal_mask(b, l, offset, None)?)
+        };
+
+        match key_pad {
+            None => Ok(causal),
+            Some(kp) => {
+                let (bk, sk) = kp.dims2()?;
+                if bk != b || sk != s {
+                    candle::bail!(
+                        "key_padding_mask shape ({},{}) != expected ({},{})",
+                        bk,
+                        sk,
+                        b,
+                        s
+                    )
+                }
+                let kp_add = self.key_padding_to_additive(kp)?; // (B,1,1,S)
+                if let Some(causal) = causal {
+                    Ok(Some(causal.broadcast_add(&kp_add)?)) // (B,1,L,S)
+                } else {
+                    // Decode step: no causal; expand kp over L
+                    let zeros = Tensor::zeros((b, 1, l, s), self.dtype, &self.device)?;
+                    Ok(Some(zeros.broadcast_add(&kp_add)?)) // (B,1,L,S)
+                }
+            }
+        }
+    }
+
+    /// NEW: stateless, mask-aware forward.
+    /// `key_padding_mask`: (B, L+offset), 1=keep, 0=pad. Pass `None` to match old behavior.
+    pub fn forward_with_mask(
+        &mut self,
+        input: &Tensor,                    // (B, L)
+        key_padding_mask: Option<&Tensor>, // (B, L+offset)
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (b, l) = input.dims2()?;
+        let mut h = self.embed_tokens.forward(input)?;
+
+        let attn = self.build_attn_mask(b, l, offset, key_padding_mask)?;
+        for layer in &mut self.layers {
+            h = layer.forward(&h, attn.as_ref(), offset)?;
+        }
+        self.norm.forward(&h)
+    }
+
+    /// Kept for compatibility (no key-padding mask).
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
@@ -353,65 +425,6 @@ impl Model {
 
         for layer in &mut self.layers {
             h = layer.forward(&h, causal.as_ref(), offset)?;
-        }
-        self.norm.forward(&h)
-    }
-
-    fn key_padding_mask(
-        &self,
-        attention_mask: &Tensor, // (B, L), 1/0
-        offset: usize,
-    ) -> Result<Tensor> {
-        let (b, l) = attention_mask.dims2()?;
-        // to model dtype/device and shape to (B,1,1,L)
-        let attn = attention_mask
-            .to_dtype(self.dtype)?
-            .to_device(&self.device)?
-            .unsqueeze(1)? // (B,1,L)
-            .unsqueeze(1)?; // (B,1,1,L)
-
-        // inv = 1 - attn  -> 1 at pad, 0 at valid
-        let inv = attn.neg()?.add_scalar(1.0)?; // (B,1,1,L)
-
-        // Use a large negative (avoid -inf * 0 -> NaN issues)
-        let minv = Tensor::new(-1e9f32, &self.device)?.to_dtype(self.dtype)?;
-        let key_mask = inv * &minv?; // (B,1,1,L): 0 for valid, -1e9 for pad
-
-        if offset == 0 {
-            Ok(key_mask)
-        } else {
-            // Past tokens (from KV cache) are assumed valid -> prepend zeros for them.
-            let zeros_past = Tensor::zeros((b, 1, 1, offset), self.dtype, &self.device)?;
-            Tensor::cat(&[&zeros_past, &key_mask], 3) // (B,1,1,L+offset)
-        }
-    }
-
-    /// Forward that accepts a (B, L) attention mask (1=keep, 0=pad) and combines it with causal mask.
-    pub fn forward_with_attention(
-        &mut self,
-        input: &Tensor,              // (B, L)
-        attention_mask: Option<&Tensor>, // (B, L) 1/0
-        offset: usize,
-    ) -> Result<Tensor> {
-        let (b, l) = input.dims2()?;
-        let mut h = self.embed_tokens.forward(input)?;
-
-        // Build causal mask when L > 1 (prefill). Decode step (L==1) uses None for speed.
-        let causal = if l == 1 { None } else { Some(self.causal_mask(b, l, offset, None)?) };
-
-        // Optionally build key padding mask and combine.
-        let combined = match (causal, attention_mask) {
-            (None, None) => None,
-            (Some(c), None) => Some(c),
-            (None, Some(am)) => Some(self.key_padding_mask(am, offset)?),
-            (Some(c), Some(am)) => {
-                let kpm = self.key_padding_mask(am, offset)?;
-                Some(c.broadcast_add(&kpm)?) // shapes: (B,1,L,L+off) + (B,1,1,L+off)
-            }
-        };
-
-        for layer in &mut self.layers {
-            h = layer.forward(&h, combined.as_ref(), offset)?;
         }
         self.norm.forward(&h)
     }
@@ -434,6 +447,21 @@ impl ModelForCausalLM {
         Ok(Self { base, lm_head })
     }
 
+    /// NEW: stateless, mask-aware forward.
+    pub fn forward_with_mask(
+        &mut self,
+        input: &Tensor,                    // (B, L)
+        key_padding_mask: Option<&Tensor>, // (B, L+offset)
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (_, l) = input.dims2()?;
+        self.base
+            .forward_with_mask(input, key_padding_mask, offset)?
+            .narrow(1, l - 1, 1)?
+            .apply(&self.lm_head)
+    }
+
+    /// Original API (no key-padding)
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_, l) = input.dims2()?;
         self.base
@@ -444,18 +472,5 @@ impl ModelForCausalLM {
 
     pub fn clear_kv_cache(&mut self) {
         self.base.clear_kv_cache();
-    }
-
-    pub fn forward_with_attention(
-        &mut self,
-        input: &Tensor,                 // (B, L)
-        attention_mask: Option<&Tensor>,// (B, L)
-        offset: usize,
-    ) -> Result<Tensor> {
-        let (_, l) = input.dims2()?;
-        self.base
-            .forward_with_attention(input, attention_mask, offset)?
-            .narrow(1, l - 1, 1)?
-            .apply(&self.lm_head)
     }
 }
