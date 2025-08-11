@@ -221,15 +221,23 @@ impl Qwen3Attention {
         let v = repeat_kv(v, self.num_kv_groups)?;
 
         // 7. Attention score
+        let k_t = k.transpose(2, 3)?;                 // [B, KvH, S, D] -> [B, KvH, D, S]
+        let att = q.matmul(&k_t)?;                     // [B, H, L, D] x [B, H, D, S] = [B, H, L, S]
+
+        // Make scale a scalar Tensor with the same dtype/device as `att`
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let scale_t = Tensor::new(scale, &att.device())?
+            .to_dtype(att.dtype()?)?;                  // scalar tensor
+
+        // Multiply by &Tensor (not by f32)
+        let mut scores = (&att * &scale_t)?;           // [B, H, L, S]
         if let Some(m) = attn_mask {
-            // m: (B, 1, L, S) where S = L + offset
+            // m: (B, 1, L, S) — broadcast add is fine
             scores = scores.broadcast_add(m)?;
         }
- 
+
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?; // (B, H, L, D)
+        let ctx = probs.matmul(&v)?;  
 
         // 8. Output proj
         ctx.transpose(1, 2)?
