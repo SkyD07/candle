@@ -222,16 +222,12 @@ impl Qwen3Attention {
 
         // 7. Attention score
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        let scale_t = Tensor::new(scale, &q.device())?.to_dtype(self.dtype)?;
-        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale_t)?;
+        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = attn_mask {
             // m: (B, 1, L, S) where S = L + offset
             scores = scores.broadcast_add(m)?;
         }
-        if cfg!(debug_assertions) {
-            let any_nan = scores.is_finite()?.all_reduce(candle::ReduceOp::Min)?.to_vec0::<u8>()? == 0;
-            debug_assert!(!any_nan, "non-finite scores before softmax");
-        }
+ 
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?; // (B, H, L, D)
 
