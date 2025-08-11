@@ -354,14 +354,13 @@ impl Model {
 
     /// Combine causal (B,1,L,S) with key-padding (B,1,1,S) if provided.
     fn keep_to_additive(&self, keep: &Tensor) -> Result<Tensor> {
-        // keep: (B,S) in {0,1}  -> additive (B,1,1,S) with {0, -BIG}
+        // keep: (B,S) in {0,1} -> additive (B,1,1,S) with {0, -BIG}
         let (b, s) = keep.dims2()?;
-        let kp = keep.to_dtype(DType::F32)?;                   // (B,S)
-        let one = Tensor::ones((b, s), DType::F32, &self.device)?; // (B,S)
-        let neg = (&one - &kp)?;                               // 1 where masked, 0 otherwise
-        // use a real tensor, not a scalar, to avoid broadcast mul issues
-        let big = Tensor::full((b, s), -1e9f32, &self.device)?;     // (B,S)
-        let add = (&neg * &big)?;                               // (B,S) -> 0 or -1e9
+        let kp  = keep.to_dtype(DType::F32)?;                           // (B,S)
+        let one = Tensor::ones((b, s), DType::F32, &self.device)?;      // (B,S)
+        let neg = (&one - &kp)?;                                        // 1 where masked
+        let big = Tensor::full(-1e9f32, (b, s), &self.device)?;         // (B,S)  ✅ note arg order
+        let add = (&neg * &big)?;                                       // (B,S) -> 0 or -1e9
         add.reshape((b, 1, 1, s))?.to_dtype(self.dtype)
     }
 
