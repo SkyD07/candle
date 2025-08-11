@@ -118,7 +118,7 @@ impl Qwen3Attention {
         vb: VarBuilder,
     ) -> Result<Self> {
         if cfg.use_sliding_window {
-            candle::bail!("sliding window is not suppored")
+            candle::bail!("sliding window is not supported")
         }
 
         let head_dim = cfg.head_dim;
@@ -221,11 +221,16 @@ impl Qwen3Attention {
         let v = repeat_kv(v, self.num_kv_groups)?;
 
         // 7. Attention score
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let scale_t = Tensor::new(scale, &q.device())?.to_dtype(self.dtype)?;
+        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale_t)?;
         if let Some(m) = attn_mask {
             // m: (B, 1, L, S) where S = L + offset
             scores = scores.broadcast_add(m)?;
+        }
+        if cfg!(debug_assertions) {
+            let any_nan = scores.is_finite()?.all_reduce(candle::ReduceOp::Min)?.to_vec0::<u8>()? == 0;
+            debug_assert!(!any_nan, "non-finite scores before softmax");
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?; // (B, H, L, D)
@@ -323,7 +328,7 @@ impl Model {
         offset: usize,
         sw: Option<usize>,
     ) -> Result<Tensor> {
-        let minf = f32::NEG_INFINITY;
+        let minf = -1e4f32;
         let mask: Vec<_> = (0..tgt)
             .flat_map(|i| {
                 (0..(tgt + offset)).map(move |j| {
@@ -343,70 +348,57 @@ impl Model {
         Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
     }
 
-    /// Convert a (B, S) key-padding mask (1=keep, 0=pad) into an additive mask (B,1,1,S).
-    /// Uses the log trick: log(1)=0, log(0)=-inf (safe for softmax).
-    fn key_padding_to_additive(&self, key_pad: &Tensor) -> Result<Tensor> {
-        let (b, s) = key_pad.dims2()?;
-        let kp_f32 = key_pad.to_dtype(DType::F32)?; // stay on device
-        let add = kp_f32.log()?;                    // 1 -> 0, 0 -> -inf
-        add.reshape((b, 1, 1, s))?.to_dtype(self.dtype)
-    }
-
     /// Combine causal (B,1,L,S) with key-padding (B,1,1,S) if provided.
     fn keep_to_additive(&self, keep: &Tensor) -> Result<Tensor> {
-        // keep: (B,S) in {0,1} -> additive (B,1,1,S) with {0, -BIG}
         let (b, s) = keep.dims2()?;
-        let kp  = keep.to_dtype(DType::F32)?;                           // (B,S)
-        let one = Tensor::ones((b, s), DType::F32, &self.device)?;      // (B,S)
-        let neg = (&one - &kp)?;                                        // 1 where masked
-        let big = Tensor::full(-1e9f32, (b, s), &self.device)?;         // (B,S)  ✅ note arg order
-        let add = (&neg * &big)?;                                       // (B,S) -> 0 or -1e9
+        let kp  = keep.to_dtype(DType::F32)?;                          // (B,S)
+        let one = Tensor::ones((b, s), DType::F32, &self.device)?;     // (B,S)
+        let neg = (&one - &kp)?;                                       // 1 where masked
+        let big = Tensor::full(-1e4f32, (b, s), &self.device)?;        // <= FP16-safe
+        let add = (&neg * &big)?;                                      // 0 or -1e4
         add.reshape((b, 1, 1, s))?.to_dtype(self.dtype)
     }
 
     /// Combine causal (B,1,L,S) with key_keep/finish_keep (B,S) if provided.
     fn build_attn_mask(
-        &self,
-        b: usize,
-        l: usize,
-        offset: usize,
-        key_keep: Option<&Tensor>,    // (B, S) with S = l + offset
-        finish_keep: Option<&Tensor>, // (B, S) with S = l + offset
+        &self, b: usize, l: usize, offset: usize,
+        key_keep: Option<&Tensor>, finish_keep: Option<&Tensor>,
     ) -> Result<Option<Tensor>> {
         let s = l + offset;
 
-        // causal is None for decode step (l==1)
-        let causal = if l == 1 {
-            None
-        } else {
-            Some(self.causal_mask(b, l, offset, None)?)
-        };
+        // Debug checks first
+        debug_assert!(l >= 1);
+        if let Some(k) = key_keep {
+            let (bk, sk) = k.dims2()?;
+            debug_assert_eq!((bk, sk), (b, s), "key_keep must be (B,S)");
+        }
+        if let Some(f) = finish_keep {
+            let (bf, sf) = f.dims2()?;
+            debug_assert_eq!((bf, sf), (b, s), "finish_keep must be (B,S)");
+        }
 
-        // Combine keep masks (pointwise AND = multiplication since {0,1})
+        // causal is None for decode step (l==1)
+        let causal = if l == 1 { None } else { Some(self.causal_mask(b, l, offset, None)?) };
+
+        // Combine keep masks (pointwise AND since {0,1})
         let keep_add = match (key_keep, finish_keep) {
             (None, None) => None,
-            (Some(k), None) => Some(self.keep_to_additive(k)?), // (B,1,1,S)
+            (Some(k), None) => Some(self.keep_to_additive(k)?),
             (None, Some(f)) => Some(self.keep_to_additive(f)?),
             (Some(k), Some(f)) => {
-                let (bk, sk) = k.dims2()?;
-                let (bf, sf) = f.dims2()?;
-                if bk != bf || sk != sf || sk != s {
-                    candle::bail!("keep masks must match and have S = l+offset")
-                }
-                let both = (k * f)?;                  // (B,S)
-                Some(self.keep_to_additive(&both)?)   // (B,1,1,S)
+                let both = (k * f)?; // (B,S)
+                Some(self.keep_to_additive(&both)?)
             }
         };
 
         match (causal, keep_add) {
-            (None, None)        => Ok(None),
-            (Some(c), None)     => Ok(Some(c)),
-            (None, Some(kadd))  => {
-                // decode step (l==1): expand keep over L
+            (None, None)       => Ok(None),
+            (Some(c), None)    => Ok(Some(c)),
+            (None, Some(kadd)) => {
                 let zeros = Tensor::zeros((b, 1, l, s), self.dtype, &self.device)?;
-                Ok(Some(zeros.broadcast_add(&kadd)?)) // (B,1,L,S)
+                Ok(Some(zeros.broadcast_add(&kadd)?))
             }
-            (Some(c), Some(kadd)) => Ok(Some(c.broadcast_add(&kadd)?)), // (B,1,L,S)
+            (Some(c), Some(kadd)) => Ok(Some(c.broadcast_add(&kadd)?)),
         }
     }
 
