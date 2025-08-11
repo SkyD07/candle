@@ -221,18 +221,17 @@ impl Qwen3Attention {
         let v = repeat_kv(v, self.num_kv_groups)?;
 
         // 7. Attention score
-        let k_t  = k.transpose(2, 3)?;                 // [B, KvH, S, D] -> [B, KvH, D, S]
-        let att  = q.matmul(&k_t)?;                    // [B, H, L, D] x [B, H, D, S] = [B, H, L, S]
+        let k_t  = k.transpose(2, 3)?;                  // [B, KvH, S, D] -> [B, KvH, D, S]
+        let att  = q.matmul(&k_t)?;                     // [B, H, L, D] x [B, H, D, S] = [B, H, L, S]
 
-        // Make scale a scalar Tensor on same device/dtype as `att`
+        // build a broadcastable scale tensor (1,1,1,1) on same device/dtype
         let scale   = 1.0f32 / (self.head_dim as f32).sqrt();
-        let scale_t = Tensor::new(scale, att.device())?          // note: no `&`
-            .to_dtype(att.dtype())?;                             // note: no `?` after dtype()
+        let scale_t = Tensor::full(scale, (1, 1, 1, 1), att.device())?
+            .to_dtype(att.dtype())?;
 
-        // Multiply tensor-by-tensor (avoid `* f32` which some revs don't impl)
-        let mut scores = (&att * &scale_t)?;                     // or: att.broadcast_mul(&scale_t)?
+        let mut scores = att.broadcast_mul(&scale_t)?;  // avoid 0-D scalar mul (rhs: [])
         if let Some(m) = attn_mask {
-            scores = scores.broadcast_add(m)?;
+            scores = scores.broadcast_add(m)?;          // m: [B,1,L,S] -> broadcast over heads
         }
 
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
