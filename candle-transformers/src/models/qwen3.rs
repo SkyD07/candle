@@ -353,44 +353,58 @@ impl Model {
     }
 
     /// Combine causal (B,1,L,S) with key-padding (B,1,1,S) if provided.
+    fn keep_to_additive(&self, keep: &Tensor) -> Result<Tensor> {
+        // keep: (B, S) in {0,1} -> additive (B,1,1,S) with {0, -inf}
+        let (b, s) = keep.dims2()?;
+        let add = keep
+            .to_dtype(DType::F32)?  // stay on device
+            .log()?;                // 1 -> 0, 0 -> -inf
+        add.reshape((b, 1, 1, s))?.to_dtype(self.dtype)
+    }
+
+    /// Combine causal (B,1,L,S) with key_keep/finish_keep (B,S) if provided.
     fn build_attn_mask(
         &self,
         b: usize,
         l: usize,
         offset: usize,
-        key_pad: Option<&Tensor>, // expected shape: (B, L+offset)
+        key_keep: Option<&Tensor>,    // (B, S) with S = l + offset
+        finish_keep: Option<&Tensor>, // (B, S) with S = l + offset
     ) -> Result<Option<Tensor>> {
         let s = l + offset;
 
-        // Causal: skip when L==1 (decode step)
+        // causal is None for decode step (l==1)
         let causal = if l == 1 {
             None
         } else {
             Some(self.causal_mask(b, l, offset, None)?)
         };
 
-        match key_pad {
-            None => Ok(causal),
-            Some(kp) => {
-                let (bk, sk) = kp.dims2()?;
-                if bk != b || sk != s {
-                    candle::bail!(
-                        "key_padding_mask shape ({},{}) != expected ({},{})",
-                        bk,
-                        sk,
-                        b,
-                        s
-                    )
+        // Combine keep masks (pointwise AND = multiplication since {0,1})
+        let keep_add = match (key_keep, finish_keep) {
+            (None, None) => None,
+            (Some(k), None) => Some(self.keep_to_additive(k)?), // (B,1,1,S)
+            (None, Some(f)) => Some(self.keep_to_additive(f)?),
+            (Some(k), Some(f)) => {
+                let (bk, sk) = k.dims2()?;
+                let (bf, sf) = f.dims2()?;
+                if bk != bf || sk != sf || sk != s {
+                    candle::bail!("keep masks must match and have S = l+offset")
                 }
-                let kp_add = self.key_padding_to_additive(kp)?; // (B,1,1,S)
-                if let Some(causal) = causal {
-                    Ok(Some(causal.broadcast_add(&kp_add)?)) // (B,1,L,S)
-                } else {
-                    // Decode step: no causal; expand kp over L
-                    let zeros = Tensor::zeros((b, 1, l, s), self.dtype, &self.device)?;
-                    Ok(Some(zeros.broadcast_add(&kp_add)?)) // (B,1,L,S)
-                }
+                let both = (k * f)?;                  // (B,S)
+                Some(self.keep_to_additive(&both)?)   // (B,1,1,S)
             }
+        };
+
+        match (causal, keep_add) {
+            (None, None)        => Ok(None),
+            (Some(c), None)     => Ok(Some(c)),
+            (None, Some(kadd))  => {
+                // decode step (l==1): expand keep over L
+                let zeros = Tensor::zeros((b, 1, l, s), self.dtype, &self.device)?;
+                Ok(Some(zeros.broadcast_add(&kadd)?)) // (B,1,L,S)
+            }
+            (Some(c), Some(kadd)) => Ok(Some(c.broadcast_add(&kadd)?)), // (B,1,L,S)
         }
     }
 
@@ -406,6 +420,22 @@ impl Model {
         let mut h = self.embed_tokens.forward(input)?;
 
         let attn = self.build_attn_mask(b, l, offset, key_padding_mask)?;
+        for layer in &mut self.layers {
+            h = layer.forward(&h, attn.as_ref(), offset)?;
+        }
+        self.norm.forward(&h)
+    }
+
+    pub fn forward_with_masks(
+        &mut self,
+        input: &Tensor,
+        key_keep: Option<&Tensor>,
+        finish_keep: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (b, l) = input.dims2()?;
+        let mut h = self.embed_tokens.forward(input)?;
+        let attn = self.build_attn_mask(b, l, offset, key_keep, finish_keep)?;
         for layer in &mut self.layers {
             h = layer.forward(&h, attn.as_ref(), offset)?;
         }
@@ -457,6 +487,20 @@ impl ModelForCausalLM {
         let (_, l) = input.dims2()?;
         self.base
             .forward_with_mask(input, key_padding_mask, offset)?
+            .narrow(1, l - 1, 1)?
+            .apply(&self.lm_head)
+    }
+
+    pub fn forward_with_masks(
+        &mut self,
+        input: &Tensor,                    // (B, L)
+        key_keep: Option<&Tensor>,         // (B, L+offset)
+        finish_keep: Option<&Tensor>,      // (B, L+offset)
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (_, l) = input.dims2()?;
+        self.base
+            .forward_with_masks(input, key_keep, finish_keep, offset)?
             .narrow(1, l - 1, 1)?
             .apply(&self.lm_head)
     }
