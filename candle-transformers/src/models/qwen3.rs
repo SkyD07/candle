@@ -408,7 +408,7 @@ impl Model {
         }
     }
 
-    /// NEW: stateless, mask-aware forward.
+    /// /// NEW: stateless, mask-aware forward.
     /// `key_padding_mask`: (B, L+offset), 1=keep, 0=pad. Pass `None` to match old behavior.
     pub fn forward_with_mask(
         &mut self,
@@ -419,7 +419,8 @@ impl Model {
         let (b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
 
-        let attn = self.build_attn_mask(b, l, offset, key_padding_mask)?;
+        // build_attn_mask now expects (key_keep, finish_keep). We only have key_keep here.
+        let attn = self.build_attn_mask(b, l, offset, key_padding_mask, None)?;
         for layer in &mut self.layers {
             h = layer.forward(&h, attn.as_ref(), offset)?;
         }
